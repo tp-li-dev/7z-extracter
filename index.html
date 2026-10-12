@@ -13,9 +13,10 @@
 <section class="panel hidden" id="workPanel"><h2>③ 変換状況</h2><div class="status" id="status" role="status" aria-live="polite">準備中</div><progress id="progress" value="0" max="100"></progress><p id="detail" class="meta"></p><button class="secondary" id="cancel" type="button">中断する</button></section>
 <section class="panel hidden" id="resultPanel"><h2>④ 保存</h2><p class="status" id="resultText"></p><button id="download" class="primary" type="button">ZIPを保存する</button><p class="meta">iOSの共有メニューまたはダウンロードから「ファイルに保存」を選択してください。大容量ZIPの受け渡しはSafari側の制限で失敗する場合があります。</p><button id="delete" class="secondary" type="button">一時ZIPを削除</button></section>
 <section class="panel hidden" id="entriesPanel"><h2>書庫内のファイル</h2><ul id="entries"></ul></section>
-<footer>外部ライブラリは初回ネット接続が必要 • ローカル処理 • HTTPS推奨<br/>7z Local prototype v0.3 · JS読み込み修正版</footer>
+<footer>外部ライブラリは初回ネット接続が必要 • ローカル処理 • HTTPS推奨<br/>7z Local prototype v0.4 · Worker診断修正版</footer>
 <script type="module">
 let Archive = null, ZipWriter = null, BlobReader = null, librariesReady = false, workerChecked = false;
+let localWorkerURL = null, workerCode = null;
 const workerUrl = 'https://cdn.jsdelivr.net/npm/libarchive.js@2.0.2/dist/worker-bundle.js';
 // jsDelivr ESM endpoint. esm.sh /main.js returned "could not resolve build entry".
 const archiveCandidates = [
@@ -42,6 +43,33 @@ function entriesFrom(root) {
     }
   }
   walk(root);return list;
+}
+function timeout(promise, ms, what) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => timer = setTimeout(() => reject(Error(`${what}が${Math.round(ms/1000)}秒間応答しません。Worker / WASMの起動失敗、または書庫処理の停止が疑われます。`)), ms))
+  ]).finally(() => clearTimeout(timer));
+}
+async function prepareWorker() {
+  // Fetch and execute as a local blob worker; a direct cross-origin Worker URL is blocked by Safari.
+  const response = await fetch(workerUrl, {mode:'cors', cache:'force-cache'});
+  if (!response.ok) throw Error(`Worker HTTP ${response.status}`);
+  workerCode = await response.text();
+  if (!workerCode.trim()) throw Error('Workerが空です');
+  if (localWorkerURL) URL.revokeObjectURL(localWorkerURL);
+  localWorkerURL = URL.createObjectURL(new Blob([workerCode], {type:'text/javascript'}));
+  // Standalone Worker smoke test: creation/error events, not a claim that WASM initialized.
+  let testWorker;
+  try {
+    testWorker = new Worker(localWorkerURL);
+    await new Promise((resolve,reject) => {
+      let settled = false;
+      testWorker.onerror = (e) => { if(!settled) {settled = true; reject(Error(`Worker実行エラー: ${e.message || 'unknown'} (${e.filename || 'blob'})`));} };
+      setTimeout(() => { if (!settled) { settled=true; resolve(); } }, 1200);
+    });
+  } finally { testWorker?.terminate(); }
+  return localWorkerURL;
 }
 function resetResult(){ $('resultPanel').classList.add('hidden'); output=null; }
 function refreshConvert(){ $('convert').disabled = !chosen || busy || !librariesReady; }
@@ -80,7 +108,7 @@ async function loadArchiveModule(){
 function showRuntime(){
   $('runtime').textContent = `7zライブラリ: ${statuses.archive} ／ ZIPライブラリ: ${statuses.zip} ／ 7z Worker: ${statuses.worker} ／ 保存領域: ${statuses.storage} ／ 回線: ${navigator.onLine?'オンライン':'オフライン（端末判定）'}`;
   $('offlineHelp').textContent = librariesReady ?
-    '⚠️ JSの読み込みは完了。ただし7z Worker起動・WASM初期化は未検証です。今はオフラインに切り替えないでください。必要リソースがオフライン保存された保証はありません。' :
+    '⚠️ Blob Workerの生成までは確認。WASM初期化とオフライン再実行は未確認です。今は通信を切らないでください。' :
     '⏳ まだオフラインにしないでください。ライブラリの読み込みが終わっていません。通信が必要です。';
 }
 async function boot(){
@@ -88,18 +116,18 @@ async function boot(){
   statuses.archive='読み込み中';statuses.zip='読み込み中';statuses.worker='確認中';showRuntime();
   Archive=null; ZipWriter=null; BlobReader=null; workerChecked=false;
   const jobs = await Promise.allSettled([
-    loadArchiveModule(),import(zipUrl),
-    fetch(workerUrl,{method:'GET',mode:'cors',cache:'force-cache'}).then(r=>{if(!r.ok)throw Error(`HTTP ${r.status}`);return r.arrayBuffer();})
+    loadArchiveModule(),import(zipUrl), prepareWorker()
   ]);
   if(jobs[0].status==='fulfilled' && jobs[0].value.Archive){
     Archive=jobs[0].value.Archive;
-    Archive.init({workerUrl});statuses.archive='✅ JS読込済み（Worker未起動）: '+jobs[0].value.url;
+    statuses.archive='✅ JS読込済み: '+jobs[0].value.url;
   }else statuses.archive='❌ 読込失敗 '+(jobs[0].reason?.message||'');
   if(jobs[1].status==='fulfilled' && jobs[1].value.ZipWriter && jobs[1].value.BlobReader){
     ZipWriter=jobs[1].value.ZipWriter; BlobReader=jobs[1].value.BlobReader;statuses.zip='✅ 読み込み済み';
   }else statuses.zip='❌ 読込失敗 '+(jobs[1].reason?.message||'');
   workerChecked=jobs[2].status==='fulfilled';
-  statuses.worker=workerChecked?'✅ HTTP取得成功（実行未確認）':'❌ 取得失敗 '+(jobs[2].reason?.message||'');
+  statuses.worker=workerChecked?'✅ Blob Worker生成成功（WASM未確認）':'❌ Worker準備失敗: '+(jobs[2].reason?.message||'');
+  if(Archive && workerChecked) { try {Archive.init({workerUrl:localWorkerURL});} catch(e) {workerChecked=false;statuses.worker='❌ 初期化エラー: '+e.message;} }
   try{
     statuses.storage=navigator.storage?.getDirectory ? '✅ OPFS APIあり' : '❌ OPFS APIなし';
   }catch(err){statuses.storage='❌ '+err.message;}
@@ -123,11 +151,12 @@ $('convert').addEventListener('click',async()=>{
     const estimate=await navigator.storage.estimate();
     if(estimate.quota && estimate.usage) display('処理の準備中',1,`ブラウザの推定空き容量: ${fmt(Math.max(0,estimate.quota-estimate.usage))}（保存可能容量は変動します）`);
     else display('7zを解析しています…',1);
-    display('7zエンジンを起動しています…',2,'Workerが起動できるか確認中');
-    opened=await Archive.open(chosen);
+    display('7zエンジンを起動しています…',2,'Blob WorkerからWASMを起動中（30秒無応答で診断を表示）');
+    opened=await timeout(Archive.open(chosen),30000,'Archive.open()');
     statuses.worker='✅ Archive.open 成功（WASM起動）';showRuntime();
     if($('password').value) await opened.usePassword($('password').value);
-    const all=entriesFrom(await opened.getFilesObject());
+    display('書庫の目録を取得中…',3,'暗号化ヘッダーや大容量書庫では時間がかかります');
+    const all=entriesFrom(await timeout(opened.getFilesObject(),60000,'ファイル一覧取得')); 
     if(!all.length) throw Error('書庫内にファイルが見つかりません。パスワードや形式を確認してください。');
     if(all.length>10000) throw Error('ファイル数が安全上限（10,000件）を超えました。');
     $('entries').replaceChildren();
