@@ -13,10 +13,11 @@
 <section class="panel hidden" id="workPanel"><h2>③ 変換状況</h2><div class="status" id="status" role="status" aria-live="polite">準備中</div><progress id="progress" value="0" max="100"></progress><p id="detail" class="meta"></p><button class="secondary" id="cancel" type="button">中断する</button></section>
 <section class="panel hidden" id="resultPanel"><h2>④ 保存</h2><p class="status" id="resultText"></p><button id="download" class="primary" type="button">ZIPを保存する</button><p class="meta">iOSの共有メニューまたはダウンロードから「ファイルに保存」を選択してください。大容量ZIPの受け渡しはSafari側の制限で失敗する場合があります。</p><button id="delete" class="secondary" type="button">一時ZIPを削除</button></section>
 <section class="panel hidden" id="entriesPanel"><h2>書庫内のファイル</h2><ul id="entries"></ul></section>
-<footer>外部ライブラリは初回ネット接続が必要 • ローカル処理 • HTTPS推奨<br/>7z Local prototype v0.4 · Worker診断修正版</footer>
+<footer>外部ライブラリは初回ネット接続が必要 • ローカル処理 • HTTPS推奨<br/>7z Local prototype v0.5 · Module Worker修正版</footer>
 <script type="module">
 let Archive = null, ZipWriter = null, BlobReader = null, librariesReady = false, workerChecked = false;
 let localWorkerURL = null, workerCode = null;
+const NativeWorker = window.Worker;
 const workerUrl = 'https://cdn.jsdelivr.net/npm/libarchive.js@2.0.2/dist/worker-bundle.js';
 // jsDelivr ESM endpoint. esm.sh /main.js returned "could not resolve build entry".
 const archiveCandidates = [
@@ -58,11 +59,14 @@ async function prepareWorker() {
   workerCode = await response.text();
   if (!workerCode.trim()) throw Error('Workerが空です');
   if (localWorkerURL) URL.revokeObjectURL(localWorkerURL);
-  localWorkerURL = URL.createObjectURL(new Blob([workerCode], {type:'text/javascript'}));
+  // Module bundles may derive their .wasm location from import.meta.url.
+  // A blob: URL cannot serve neighboring files, so preserve the original CDN script URL.
+  const patchedCode = workerCode.replace(/\bimport\.meta\.url\b/g, JSON.stringify(workerUrl));
+  localWorkerURL = URL.createObjectURL(new Blob([patchedCode], {type:'text/javascript'}));
   // Standalone Worker smoke test: creation/error events, not a claim that WASM initialized.
   let testWorker;
   try {
-    testWorker = new Worker(localWorkerURL);
+    testWorker = new NativeWorker(localWorkerURL, {type:'module'});
     await new Promise((resolve,reject) => {
       let settled = false;
       testWorker.onerror = (e) => { if(!settled) {settled = true; reject(Error(`Worker実行エラー: ${e.message || 'unknown'} (${e.filename || 'blob'})`));} };
@@ -71,6 +75,17 @@ async function prepareWorker() {
   } finally { testWorker?.terminate(); }
   return localWorkerURL;
 }
+// libarchive.js constructs a classic Worker internally; direct it to the
+// module Worker required by the CDN bundle, leaving other Workers untouched.
+window.Worker = class ArchiveModuleWorker extends NativeWorker {
+  constructor(url, options={}) {
+    if (url === localWorkerURL && localWorkerURL) {
+      super(url, {...options, type:'module'});
+    } else {
+      super(url, options);
+    }
+  }
+};
 function resetResult(){ $('resultPanel').classList.add('hidden'); output=null; }
 function refreshConvert(){ $('convert').disabled = !chosen || busy || !librariesReady; }
 async function handleFileSelection(e){
@@ -108,7 +123,7 @@ async function loadArchiveModule(){
 function showRuntime(){
   $('runtime').textContent = `7zライブラリ: ${statuses.archive} ／ ZIPライブラリ: ${statuses.zip} ／ 7z Worker: ${statuses.worker} ／ 保存領域: ${statuses.storage} ／ 回線: ${navigator.onLine?'オンライン':'オフライン（端末判定）'}`;
   $('offlineHelp').textContent = librariesReady ?
-    '⚠️ Blob Workerの生成までは確認。WASM初期化とオフライン再実行は未確認です。今は通信を切らないでください。' :
+    '⚠️ Module Workerの構文確認まで完了。WASM初期化とオフライン再実行は未確認です。今は通信を切らないでください。' :
     '⏳ まだオフラインにしないでください。ライブラリの読み込みが終わっていません。通信が必要です。';
 }
 async function boot(){
@@ -126,7 +141,7 @@ async function boot(){
     ZipWriter=jobs[1].value.ZipWriter; BlobReader=jobs[1].value.BlobReader;statuses.zip='✅ 読み込み済み';
   }else statuses.zip='❌ 読込失敗 '+(jobs[1].reason?.message||'');
   workerChecked=jobs[2].status==='fulfilled';
-  statuses.worker=workerChecked?'✅ Blob Worker生成成功（WASM未確認）':'❌ Worker準備失敗: '+(jobs[2].reason?.message||'');
+  statuses.worker=workerChecked?'✅ Module Worker構文確認（WASM未確認）':'❌ Worker準備失敗: '+(jobs[2].reason?.message||'');
   if(Archive && workerChecked) { try {Archive.init({workerUrl:localWorkerURL});} catch(e) {workerChecked=false;statuses.worker='❌ 初期化エラー: '+e.message;} }
   try{
     statuses.storage=navigator.storage?.getDirectory ? '✅ OPFS APIあり' : '❌ OPFS APIなし';
@@ -151,7 +166,7 @@ $('convert').addEventListener('click',async()=>{
     const estimate=await navigator.storage.estimate();
     if(estimate.quota && estimate.usage) display('処理の準備中',1,`ブラウザの推定空き容量: ${fmt(Math.max(0,estimate.quota-estimate.usage))}（保存可能容量は変動します）`);
     else display('7zを解析しています…',1);
-    display('7zエンジンを起動しています…',2,'Blob WorkerからWASMを起動中（30秒無応答で診断を表示）');
+    display('7zエンジンを起動しています…',2,'Module WorkerからWASMを起動中（30秒無応答で診断を表示）');
     opened=await timeout(Archive.open(chosen),30000,'Archive.open()');
     statuses.worker='✅ Archive.open 成功（WASM起動）';showRuntime();
     if($('password').value) await opened.usePassword($('password').value);
