@@ -1,0 +1,391 @@
+<!doctype html>
+<html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#0a1020"><title>7z Local v1.0 — 大容量メモリ改善</title>
+<style>
+:root{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color-scheme:dark;background:#080f1c;color:#ecf3ff}*{box-sizing:border-box}body{margin:0}main{max-width:720px;margin:auto;padding:calc(25px + env(safe-area-inset-top)) 17px 60px}h1{font-size:clamp(27px,6vw,39px);margin:0;letter-spacing:-.8px}h2{font-size:16px;margin:0 0 13px}.brand{color:#84acfa;font-weight:800;margin:0 0 28px;font-size:20px}p{line-height:1.65}.muted,.note{color:#abbdd6;font-size:13px}.note{background:#1d283d;padding:12px;border-radius:10px;margin-top:14px}.panel{border:1px solid #2d405c;border-radius:17px;background:#131e30;padding:19px;margin:14px 0}.picker{position:relative;border:2px dashed #527bab;border-radius:12px;padding:22px;text-align:center;display:block;background:#172740}.picker input{position:absolute;inset:0;opacity:0;width:100%;height:100%;cursor:pointer}.picker strong{display:block}input[type=password]{border:1px solid #465b79;color:#fff;background:#0b1526;padding:13px;width:100%;font-size:16px;border-radius:10px;margin-top:8px}button{border:0;border-radius:11px;padding:13px 16px;font-size:15px;font-weight:700;cursor:pointer}button.primary{background:#85b2ff;color:#081324;width:100%;margin-top:14px}button.secondary{background:#2a3d59;color:#f2f5ff;margin-top:10px}button:disabled{opacity:.45;cursor:not-allowed}.kv{white-space:pre-wrap;overflow-wrap:anywhere;color:#c0d3ec;font-size:12px;line-height:1.7}.good{color:#85dfb0}.bad{color:#ff9b9b}.warn{color:#f5cc7a}.hidden{display:none}progress{width:100%;height:13px;margin-top:12px}ul{max-height:210px;overflow:auto;list-style:none;padding:0}li{padding:7px 0;border-bottom:1px solid #293750;font-size:12px;overflow-wrap:anywhere}.flex{display:flex;gap:8px;flex-wrap:wrap}.flex button{flex:1;min-width:125px}small{font-size:12px;color:#b4c7de}.label{font-size:13px;display:block;margin-top:16px}footer{color:#7e93b0;font-size:11px;text-align:center;margin-top:22px}
+</style></head><body><main>
+<div class="brand">7z <span style="color:#f2f6ff">Local</span> · v1.0</div>
+<h1>7z → パスワードなしZIP</h1>
+<p class="muted">2GB超の書庫を丸ごとメモリに読み込まない方式。展開後にWASM Workerを終了し、ZIP生成を固定チャンクに制限します。復号・ZIP生成は端末上で処理し、ファイルもパスワードもアップロードしません。</p>
+<section class="panel"><h2>動作チェック</h2><div id="checks" class="kv">確認中…</div><div id="offline" class="note">初回ライブラリ読み込みに通信が必要です。通信を切るのはまだ待ってください。</div><button class="secondary" id="retry" type="button">ライブラリを再確認</button></section>
+<section class="panel"><h2>① 書庫を選択</h2><label class="picker">📦 <strong>7zファイルを選択</strong><small>iPhoneの「ファイル」から選べます</small><input id="source" type="file" accept=".7z,application/x-7z-compressed"></label><p id="selected" class="kv">未選択</p><label class="label" for="password">② パスワード（暗号化されている場合）</label><input id="password" type="password" autocomplete="off" placeholder="パスワードを入力"><button id="convert" class="primary" disabled>7zをZIPへ変換</button><p class="note">大容量実験版。7-Zip WASMはWORKERFSから読み、-soのバイナリ出力をOPFSへ順次書き込みます。7zの辞書サイズやSafariの空き容量次第で失敗する場合があります。</p></section>
+<section class="panel hidden" id="processPanel"><h2>③ 処理状況</h2><div id="status">待機中</div><progress id="progress" max="100" value="0"></progress><p id="detail" class="kv"></p><button id="cancel" class="secondary" type="button">停止する</button></section>
+<section class="panel hidden" id="entryPanel"><h2>書庫内のファイル</h2><div id="total" class="muted"></div><ul id="entries"></ul></section>
+<section class="panel hidden" id="resultPanel"><h2>④ ZIPの保存</h2><p id="resultInfo" class="kv"></p><button id="download" class="primary">ZIPを保存する</button><button id="delete" class="secondary">一時ZIPを削除</button><p class="note">ZIPはOPFSに保存済みです。ただしiOS Safariで数GBのダウンロードをファイルアプリに渡せるかは未検証です。変換成功と保存成功は別です。</p></section>
+<section class="panel"><h2>クラッシュ診断</h2><p class="kv" id="diagnosis"></p><div class="flex"><button id="copy" class="secondary">ログをコピー</button><button id="clear" class="secondary">ログを消去</button></div><p class="muted">再読み込み後も、最後に記録できた工程が残ります。パスワードやファイル名は保存しません。</p></section>
+<footer>7z Local · Browser-only prototype · 7z-wasm 1.2.0 / Direct ZIP64<br>7z標準出力→OPFS→ZIP64逐次書き込み。Safari実機の完走は未検証。v1.0は単一ファイルのZIP前にWorkerを終了。</footer>
+</main>
+<script id="archive-worker" type="text/plain">
+// Web Worker: load sevenZip WASM here, never load the whole source File into an ArrayBuffer.
+const WASM_BASE='https://cdn.jsdelivr.net/npm/7z-wasm@1.2.0/';
+let file, password='', zipModule, archiveModule, count=0, pendingAck=null, cancelled=false, stageName='';
+const send=(type,extra={})=>postMessage({type,...extra});
+const safeName=name=>{
+  const p=String(name).replace(/\\/g,'/').replace(/\/$/,'');
+  if(!p||p.startsWith('/')||p.includes('\0')||/^[A-Za-z]:/.test(p)||p.split('/').some(s=>s===''||s==='.'||s==='..'))throw Error('書庫内に危険なパスを検出しました');
+  return p;
+};
+const mountInput=(mod)=>{
+  mod.FS.mkdir('/source');
+  // The File stays in browser-managed storage; FileReaderSync serves read ranges to WORKERFS.
+  mod.FS.mount(mod.WORKERFS,{blobs:[{name:'archive.7z',data:file}]},'/source');
+};
+async function makeEngine(){
+  if(!zipModule){const pkg=await import(WASM_BASE+'7zz.es6.js');zipModule=pkg.default;if(typeof zipModule!=='function')throw Error('7-Zip初期化関数がありません');}
+  const lines=[];
+  const engine=await zipModule({locateFile:n=>WASM_BASE+n,print:s=>{if(lines.length<200000)lines.push(String(s));},printErr:s=>{if(lines.length<200000)lines.push(String(s));}});
+  if(!engine.WORKERFS)throw Error('7z-wasmにWORKERFSがありません');
+  mountInput(engine);
+  return {engine,lines};
+}
+function runCommand(mod,args,lines){
+  lines.length=0;
+  let code;
+  try{code=mod.callMain([...args]);}
+  catch(e){throw Error('WASM実行エラー: '+String(e?.message||e)+'\n'+sanitizeText(lines));}
+  const output=lines.join('\n');
+  if(typeof code==='number'&&code!==0)throw Error('7-Zip終了コード '+code+'（致命的なエラー）\n'+sanitizeText(lines));
+  if(/\b(Errors:\s*[1-9]|Wrong password|Data Error|Can not open|ERROR:)/i.test(output))throw Error('7-Zipがエラーを報告しました\n'+sanitizeText(lines));
+  return output;
+}
+function sanitizeText(lines){
+  const secrets=[password,file?.name].filter(Boolean);
+  let s=lines.slice(-65).join('\n');
+  for(const secret of secrets)s=s.split(secret).join('[非表示]');
+  return s.replace(/\/source\/archive\.7z/g,'[archive]').slice(-2000);
+}
+function parseListing(text){
+  const lines=text.split(/\r?\n/);
+  // `7zz l -slt` prints archive metadata before a row of dashes; skip that metadata.
+  let sep=lines.findIndex(x=>/^[-]{8,}$/.test(x.trim()));
+  if(sep<0)throw Error('7zの一覧を解析できませんでした（パスワードや形式を確認）');
+  const rows=[];let fields={};
+  const push=()=>{
+    if(!fields.Path)return;
+    if(fields.Folder==='+'||String(fields.Attributes||'').startsWith('D'))return;
+    const path=safeName(fields.Path);
+    const size=Number(fields.Size);
+    if(!Number.isSafeInteger(size)||size<0)throw Error('エントリのサイズが不正です: '+path);
+    rows.push({path,size});
+  };
+  for(const l of lines.slice(sep+1)){
+    if(!l.trim()){if(Object.keys(fields).length){push();fields={};}continue;}
+    const at=l.indexOf(' = ');
+    if(at>0)fields[l.slice(0,at)]=l.slice(at+3);
+  }
+  if(Object.keys(fields).length)push();
+  if(!rows.length)throw Error('書庫にファイルが見つかりませんでした');
+  if(rows.length>10000)throw Error('ファイル数が安全上限（1万件）を超えています');
+  const seen=new Set();let sum=0;
+  for(const item of rows){if(seen.has(item.path))throw Error('同名エントリが重複しています');seen.add(item.path);sum+=item.size;}
+  if(sum>200*1024**3)throw Error('展開後200GiBを超えるため安全上停止しました');
+  return {rows,sum};
+}
+// 7z -so emits uncompressed bytes to file descriptor 1. We intercept the
+// Emscripten FS stdout stream and forward them synchronously into OPFS.
+// This avoids the previous v0.7 trick (pre-created MEMFS output node),
+// which 7-Zip could unlink or recreate before writing.
+function connectStdoutToOPFS(mod,access,expectedSize,index,total){
+  const stdout=mod.FS.streams[1];
+  if(!stdout||!stdout.stream_ops||typeof stdout.stream_ops.write!=='function'){
+    throw Error('WASM標準出力の書き込み処理が見つかりません');
+  }
+  let written=0,reportAt=64*1024*1024;
+  const prior=stdout.stream_ops;
+  stdout.stream_ops={...prior,write(_stream,buffer,offset,length,_position){
+    if(!length)return 0;
+    if(written+length>expectedSize)throw Error('展開サイズが予告値を超えました。書庫データを確認してください');
+    let done=0;
+    while(done<length){
+      // Important: pass a view of WASM memory; do not buffer the whole file.
+      const chunk=buffer.subarray(offset+done,offset+length);
+      const n=access.write(chunk,{at:written});
+      if(!(n>0))throw Error('OPFSへの書き込みが停止しました');
+      done+=n;written+=n;
+    }
+    if(written>=reportAt){
+      send('bytes',{index,total,written,expected:expectedSize});
+      reportAt=written+64*1024*1024;
+    }
+    return length;
+  }};
+  return ()=>written;
+}
+async function run(fileParam,pwd,tmpName){
+  file=fileParam;password=pwd;stageName=tmpName;cancelled=false;count=0;
+  send('phase',{stage:'ENGINE_INIT',message:'7-Zip WASMを起動中'});
+  let tmp=await makeEngine();
+  send('phase',{stage:'INPUT_MOUNTED',message:'WORKERFSで入力参照完了（全量コピーなし）'});
+  const opt=password?['-p'+password]:[];
+  send('phase',{stage:'LIST_START',message:'書庫のファイル情報を解析中'});
+  const listing=runCommand(tmp.engine,['l','-slt','/source/archive.7z',...opt],tmp.lines);
+  const manifest=parseListing(listing);
+  const items=manifest.rows;
+  send('manifest',{items,sum:manifest.sum});
+  // No promise of memory release by nulling a WASM instance; the worker
+  // remains alive, so avoid creating multiple concurrent modules.
+  tmp=null;
+  const root=await navigator.storage.getDirectory();
+  const stage=await root.getFileHandle(stageName,{create:true});
+  for(let i=0;i<items.length;i++){
+    if(cancelled)throw Error('中断しました');
+    const item=items[i];
+    send('phase',{stage:'EXTRACT_START',index:i+1,total:items.length,message:'展開してOPFSへ直接書き込み中: '+(i+1)+'/'+items.length});
+    const v=await makeEngine();
+    const access=await stage.createSyncAccessHandle();
+    let bytes=0;
+    try{
+      access.truncate(0);
+      const getWritten=connectStdoutToOPFS(v.engine,access,item.size,i+1,items.length);
+      // -so: binary stdout; -bso0/-bsp0: no console status on stdout.
+      // -spd: filename passed literally; no wildcard expansion.
+      // -mmt1: avoid excessive temporary memory on constrained phones.
+      send('phase',{stage:'STDOUT_CONNECTED',index:i+1,total:items.length,message:'バイナリストリーム接続完了・展開中'});
+      runCommand(v.engine,['x','-so','-spd','-mmt1','-bso0','-bsp0','/source/archive.7z',...opt,'--',item.path],v.lines);
+      bytes=getWritten();
+      if(bytes!==item.size)throw Error('展開データのサイズ不一致: '+bytes+' / '+item.size+' バイト。パスワードや破損を確認してください');
+      access.flush();
+    }finally{access.close();}
+    send('entry',{index:i+1,total:items.length,path:item.path,size:item.size,actualBytes:bytes});
+    await new Promise((resolve,reject)=>{pendingAck={resolve,reject};});
+    pendingAck=null;
+  }
+  send('done');
+}
+onmessage=(ev)=>{
+  const m=ev.data||{};
+  if(m.type==='start'){run(m.file,m.password||'',m.stageName).catch(e=>send('error',{message:String(e?.message||e),stage:'WORKER'}));}
+  else if(m.type==='ack'&&pendingAck)pendingAck.resolve();
+  else if(m.type==='stop'){cancelled=true;if(pendingAck)pendingAck.reject(Error('中断しました'));}
+};
+</script>
+<script type="module">
+const $=id=>document.getElementById(id);
+const CDN7='https://cdn.jsdelivr.net/npm/7z-wasm@1.2.0/';
+// ZIP64 STORE writer: streamed reads and writes. Never buffers the entire entry.
+const enc=new TextEncoder();
+const u16=(dv,o,v)=>dv.setUint16(o,v,true);
+const u32=(dv,o,v)=>dv.setUint32(o,v>>>0,true);
+const u64=(dv,o,v)=>dv.setBigUint64(o,BigInt(v),true);
+const table=Uint32Array.from({length:256},(_,n)=>{for(let i=0;i<8;i++)n=(n&1)?(0xedb88320^(n>>>1)):(n>>>1);return n>>>0;});
+function crcChunk(crc,bytes){for(let i=0;i<bytes.length;i++)crc=table[(crc^bytes[i])&255]^(crc>>>8);return crc>>>0;}
+function bytesBuf(length,fill){const b=new Uint8Array(length);fill(new DataView(b.buffer));return b;}
+class DirectZip64 {
+  constructor(out){this.out=out;this.pos=0n;this.entries=[];this.closed=false;}
+  async write(b){await this.out.write(b);this.pos+=BigInt(b.length);}
+  async addFile(name,blob,onProgress){
+    if(this.closed)throw Error('ZIPは確定済み');
+    const path=enc.encode(name), size=BigInt(blob.size), offset=this.pos;
+    if(path.length>65535)throw Error('ファイル名が長すぎます');
+    // ZIP64 local header; sizes are provided in the ZIP64 extra field.
+    const header=bytesBuf(30+path.length+20,d=>{
+      u32(d,0,0x04034b50);u16(d,4,45);u16(d,6,0x0808);u16(d,8,0);
+      u32(d,14,0);u32(d,18,0xffffffff);u32(d,22,0xffffffff);
+      u16(d,26,path.length);u16(d,28,20);
+      new Uint8Array(d.buffer).set(path,30);
+      u16(d,30+path.length,0x0001);u16(d,32+path.length,16);
+      u64(d,34+path.length,size);u64(d,42+path.length,size);
+    });
+    await this.write(header);
+    let crc=0xffffffff, done=0n;
+    // Fixed-size Blob slices give a strict ceiling for JS-side read buffers.
+    // Avoid Blob.stream()'s implementation-selected buffer sizes on iOS.
+    const CHUNK=1024*1024;
+    for(let offset=0;offset<blob.size;offset+=CHUNK){
+      const value=new Uint8Array(await blob.slice(offset,Math.min(blob.size,offset+CHUNK)).arrayBuffer());
+      crc=crcChunk(crc,value);
+      await this.write(value);
+      done+=BigInt(value.byteLength);
+      if(onProgress)await onProgress(Number(done),Number(size));
+      // Yield periodically so WebKit can collect old ArrayBuffers.
+      if((offset%(16*CHUNK))===0)await new Promise(r=>setTimeout(r,0));
+    }
+    if(done!==size)throw Error('ZIP入力のサイズが一致しません');
+    crc=(crc^0xffffffff)>>>0;
+    const descriptor=bytesBuf(24,d=>{u32(d,0,0x08074b50);u32(d,4,crc);u64(d,8,size);u64(d,16,size);});
+    await this.write(descriptor);
+    this.entries.push({path,size,offset,crc});
+  }
+  async close(){
+    if(this.closed)return;this.closed=true;
+    const start=this.pos;
+    for(const {path,size,offset,crc} of this.entries){
+      const b=bytesBuf(46+path.length+28,d=>{
+        u32(d,0,0x02014b50);u16(d,4,45);u16(d,6,45);u16(d,8,0x0808);u16(d,10,0);
+        u32(d,16,crc);u32(d,20,0xffffffff);u32(d,24,0xffffffff);
+        u16(d,28,path.length);u16(d,30,28);u16(d,32,0);u16(d,34,0);u16(d,36,0);
+        u32(d,38,0);u32(d,42,0xffffffff);
+        new Uint8Array(d.buffer).set(path,46);
+        u16(d,46+path.length,0x0001);u16(d,48+path.length,24);
+        u64(d,50+path.length,size);u64(d,58+path.length,size);u64(d,66+path.length,offset);
+      });
+      await this.write(b);
+    }
+    const centralSize=this.pos-start, zip64End=this.pos;
+    await this.write(bytesBuf(56,d=>{
+      u32(d,0,0x06064b50);u64(d,4,44n);u16(d,12,45);u16(d,14,45);
+      u32(d,16,0);u32(d,20,0);u64(d,24,this.entries.length);u64(d,32,this.entries.length);
+      u64(d,40,centralSize);u64(d,48,start);
+    }));
+    await this.write(bytesBuf(20,d=>{u32(d,0,0x07064b50);u32(d,4,0);u64(d,8,zip64End);u32(d,16,1);}));
+    await this.write(bytesBuf(22,d=>{
+      u32(d,0,0x06054b50);u16(d,8,Math.min(this.entries.length,65535));u16(d,10,Math.min(this.entries.length,65535));
+      u32(d,12,Number(centralSize>0xffffffffn?0xffffffffn:centralSize));
+      u32(d,16,Number(start>0xffffffffn?0xffffffffn:start));
+    }));
+    await this.out.close();
+  }
+}
+
+const fmt=n=>n<1024?n+' B':(n/1024**Math.floor(Math.log(n)/Math.log(1024))).toFixed(2)+' '+['B','KiB','MiB','GiB','TiB'][Math.floor(Math.log(n)/Math.log(1024))];
+let selected=null,worker=null,work=false,ready=false,writer=null,zipHandle=null,zipOutput=null,zipName='',runId='',stageName='',pending=false,lastStage='',downloadURL=null;
+const LOG='sevenzip-local-diag-v10';let history=[];
+try{history=JSON.parse(localStorage.getItem(LOG)||localStorage.getItem('sevenzip-local-diag-v09')||'[]');}catch{}
+if(!Array.isArray(history))history=[];
+function diag(){
+  const last=history.at(-1);const unfinished=last&&!['SUCCESS','ERROR','STOP'].includes(last.stage);
+  $('diagnosis').textContent=(unfinished?'⚠️ 前回は正常終了を確認できません（クラッシュ・再読み込みの疑い）\n':'')+(history.length?history.slice(-18).map(x=>x.time+'  '+x.stage+(x.details?' — '+x.details:'')).join('\n'):'履歴なし');
+}
+function mark(stage,details=''){lastStage=stage;history.push({time:new Date().toISOString(),stage,details:String(details).slice(0,120)});history=history.slice(-35);try{localStorage.setItem(LOG,JSON.stringify(history));}catch{}diag();}
+function status(s,n,detail=''){ $('processPanel').classList.remove('hidden');$('status').textContent=s;if(n!==null)$('progress').value=n;$('detail').textContent=detail; }
+function selectEnable(){$('convert').disabled=work||!ready||!selected;}
+async function checkLibs(){
+  ready=false;selectEnable();$('checks').textContent='確認中…';
+  const all=await Promise.allSettled([fetch(CDN7+'7zz.es6.js',{cache:'force-cache'}),fetch(CDN7+'7zz.wasm',{cache:'force-cache'})]);
+  const js=all[0].status==='fulfilled'&&all[0].value.ok;
+  const wasm=all[1].status==='fulfilled'&&all[1].value.ok;
+  const zip=true; // bundled ZIP64 writer: no CDN dependency
+  $('checks').textContent='7-Zip JS: '+(js?'✅ HTTP取得成功':'❌ 読み込み失敗')+'\n7-Zip WASM: '+(wasm?'✅ HTTP取得成功':'❌ 読み込み失敗')+'\nZIPエンジン: '+(zip?'✅ 読み込み済み':'❌ 読み込み失敗')+'\nWORKERFS: '+(typeof Worker!=='undefined'?'Worker APIあり（実行時確認）':'Worker不可')+'\nOPFS: '+(navigator.storage?.getDirectory?'✅ APIあり':'❌ 利用不可')+'\n回線: '+(navigator.onLine?'オンライン':'オフライン');
+  ready=Boolean(js&&wasm&&zip&&navigator.storage?.getDirectory&&typeof Worker!=='undefined');
+  $('offline').textContent='⚠️ 現段階ではオフライン利用可能と判断できません。依存ファイルをHTTPキャッシュで取得していても、Safariの再起動後に再利用できる保証はありません。通信は切らずに試してください。';
+  selectEnable();
+}
+$('retry').onclick=checkLibs;
+$('source').addEventListener('change',async(e)=>{
+  const file=e.currentTarget.files?.[0]||null;selected=null;
+  if(!file){$('selected').textContent='未選択';selectEnable();return;}
+  $('selected').textContent='ファイルの先頭を検査中…';
+  try{
+    const bytes=new Uint8Array(await file.slice(0,6).arrayBuffer());
+    if(bytes.length<6||![0x37,0x7a,0xbc,0xaf,0x27,0x1c].every((b,i)=>bytes[i]===b))throw Error('7zのヘッダーではありません');
+    selected=file;
+    $('selected').textContent='✅ '+file.name+'\n'+fmt(file.size)+'・7zヘッダー確認済み（書庫全体は未読込）';
+  }catch(err){$('selected').textContent='❌ '+err.message;}
+  selectEnable();
+});
+$('clear').onclick=()=>{history=[];try{localStorage.removeItem(LOG)}catch{}diag();};
+$('copy').onclick=()=>navigator.clipboard?.writeText($('diagnosis').textContent).catch(()=>{});
+async function teardown(fail){
+  if(worker){worker.terminate();worker=null;}
+  if(fail){try{await writer?.close()}catch{}try{const root=await navigator.storage.getDirectory();if(runId)await root.removeEntry(runId);}catch{}}
+  try{if(stageName){const root=await navigator.storage.getDirectory();await root.removeEntry(stageName);}}catch{}
+  stageName='';writer=null;work=false;selectEnable();$('cancel').disabled=true;
+}
+async function abort(reason){mark('ERROR',reason);status('変換できませんでした',null,reason);await teardown(true);}
+$('convert').onclick=async()=>{
+  if(work||!selected||!ready)return;
+  work=true;selectEnable();$('cancel').disabled=false;
+  $('resultPanel').classList.add('hidden');$('entryPanel').classList.add('hidden');zipOutput=null;
+  runId='7z-local-result-'+crypto.randomUUID()+'.zip';
+  stageName='7z-local-stage-'+crypto.randomUUID()+'.tmp';
+  mark('BEGIN',fmt(selected.size));status('変換の準備中',1,'');
+  try{
+    const root=await navigator.storage.getDirectory();
+    zipHandle=await root.getFileHandle(runId,{create:true});
+    const stream=await zipHandle.createWritable({keepExistingData:false});
+    writer=new DirectZip64(stream);
+    mark('ZIP_CREATED');
+    const blob=new Blob([$('archive-worker').textContent],{type:'text/javascript'});
+    const blobURL=URL.createObjectURL(blob);
+    try{worker=new Worker(blobURL,{type:'module'});}finally{URL.revokeObjectURL(blobURL);}
+    worker.onerror=(e)=>abort('Workerエラー: '+(e.message||'unknown')).catch(()=>{});
+    worker.onmessage=(e)=>processMessage(e.data).catch(err=>abort(err.message||String(err)));
+    mark('WORKER_START');
+    worker.postMessage({type:'start',file:selected,password:$('password').value,stageName});
+    status('Workerを起動中',2,'入力7zはWorkerへFileとして渡します。全量ArrayBufferコピーはしません。');
+  }catch(err){await abort(err.message||String(err));}
+};
+async function processMessage(m){
+  if(!work||!m)return;
+  if(m.type==='phase'){
+    if(m.stage==='EXTRACT_START'){mark('EXTRACT_START',m.index+'/'+m.total);status(m.message,7+Math.round(80*(m.index-1)/m.total),'7z -soを使用してOPFSへ逐次保存します。');}
+    else{mark(m.stage);status(m.message,m.stage==='LIST_START'?5:3);}
+  }else if(m.type==='bytes'){
+    mark('EXTRACT_BYTES',m.index+'/'+m.total+' — '+fmt(m.written)+' / '+fmt(m.expected));
+    status('展開データをOPFSへ保存中',7+Math.round(77*((m.index-1)+m.written/Math.max(1,m.expected))/m.total),fmt(m.written)+' / '+fmt(m.expected));
+  }else if(m.type==='manifest'){
+    const sum=m.sum;mark('MANIFEST',m.items.length+' files; '+fmt(sum));
+    $('total').textContent=m.items.length+' 件・展開後 '+fmt(sum)+'（ZIPはほぼ同サイズ。空き容量を確保してください）';
+    $('entries').replaceChildren();for(const item of m.items.slice(0,120)){const li=document.createElement('li');li.textContent=item.path+' — '+fmt(item.size);$('entries').append(li);}
+    $('entryPanel').classList.remove('hidden');
+    const estimate=await navigator.storage.estimate().catch(()=>null);
+    if(estimate&&estimate.quota&&estimate.usage!=null){const free=Math.max(0,estimate.quota-estimate.usage);if(free<sum*0.98)throw Error('OPFS推定空き容量不足: '+fmt(free)+' / 展開後 '+fmt(sum));}
+    status('一覧を取得しました',7,'ZIPは無圧縮（Store）で保存。必要容量: 約 '+fmt(sum));
+  }else if(m.type==='entry'){
+    mark('ENTRY_READY',m.index+'/'+m.total+' — '+fmt(m.actualBytes||m.size));
+    const root=await navigator.storage.getDirectory();
+    const temp=await root.getFileHandle(stageName);
+    const blob=await temp.getFile();
+    // OPFS-backed Blob is consumed incrementally; no ZIP library entry buffering.
+    if(blob.size!==m.size)throw Error('一時ファイルのサイズが一致しません');
+    // One-entry archives (including this 2.36 GiB case): no further 7-Zip work is needed.
+    // Terminating the WASM worker before ZIP output removes its linear memory
+    // from the live process as soon as WebKit can reclaim it.
+    const isLast=m.index===m.total;
+    if(isLast && worker){
+      mark('WORKER_TERMINATE_START','7-Zipの展開完了。ZIP処理前にWASM Workerを解放');
+      worker.terminate();worker=null;
+      mark('WORKER_TERMINATED');
+      // Important: request a GC opportunity without assuming a GC has run.
+      await new Promise(r=>setTimeout(r,150));
+    }
+    mark('ZIP_ENTRY_START',m.index+'/'+m.total);
+    let lastMark=0;
+    await writer.addFile(m.path,blob,async (written,totalBytes)=>{
+      if(written-lastMark>=64*1024*1024||written===totalBytes){
+        lastMark=written;mark('ZIP_BYTES',m.index+'/'+m.total+' — '+fmt(written)+' / '+fmt(totalBytes));
+        status('ZIP64へ逐次書き込み中',86+Math.round(10*written/Math.max(1,totalBytes)),fmt(written)+' / '+fmt(totalBytes));
+        await new Promise(r=>setTimeout(r,0));
+      }
+    });
+    mark('ZIP_ENTRY_OK',m.index+'/'+m.total);
+    status('ZIPに追加しました: '+m.index+'/'+m.total,7+Math.round(88*m.index/m.total),m.path+' — '+fmt(m.size));
+    if(isLast){
+      await finishZip();
+    }else{
+      worker.postMessage({type:'ack'});
+    }
+  }else if(m.type==='done'){
+    await finishZip();
+  }else if(m.type==='error'){throw Error(m.message||'Workerからのエラー');}
+}
+async function finishZip(){
+    mark('ZIP_CLOSE_START');status('ZIP64を確定中…',97);
+    await writer.close();writer=null;
+    zipOutput=await zipHandle.getFile();
+    zipName=selected.name.replace(/\.7z$/i,'')+'-unlocked.zip';
+    $('resultInfo').textContent='✅ ZIP生成完了: '+zipName+'\n'+fmt(zipOutput.size)+'\nファイルは端末のブラウザ保存領域にあります。';
+    $('resultPanel').classList.remove('hidden');mark('SUCCESS',fmt(zipOutput.size));
+    status('変換完了',100,'「ZIPを保存する」からiPhoneに保存できます。');
+    await teardown(false);
+}
+$('cancel').onclick=()=>{
+  if(!work)return;mark('STOP','手動停止');status('Workerを停止しています',null);teardown(true);
+};
+$('download').onclick=()=>{
+  if(!zipOutput)return;
+  if(downloadURL)URL.revokeObjectURL(downloadURL);
+  downloadURL=URL.createObjectURL(zipOutput);
+  const a=document.createElement('a');a.href=downloadURL;a.download=zipName;document.body.appendChild(a);a.click();a.remove();
+  $('resultInfo').textContent+='\n保存操作を要求しました。iOS側の完了は確認できません。';
+};
+$('delete').onclick=async()=>{
+  if(work)return;
+  if(runId){try{const root=await navigator.storage.getDirectory();await root.removeEntry(runId);}catch(e){alert(e.message||e);}}
+  if(downloadURL){URL.revokeObjectURL(downloadURL);downloadURL=null;}
+  $('resultPanel').classList.add('hidden');zipOutput=null;
+};
+window.addEventListener('error',e=>{if(work)mark('JS_ERROR',e.message||'unknown');});
+window.addEventListener('unhandledrejection',e=>{if(work)mark('PROMISE_ERROR',e.reason?.message||'unknown');});
+window.addEventListener('online',()=>{if(!work)checkLibs();});
+diag();checkLibs();
+</script></body></html>
